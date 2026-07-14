@@ -93,6 +93,8 @@ namespace ams::mitm::ldn {
             LANDiscovery *discovery;
         public:
             std::unordered_map<MacAddress, NetworkInfo, MacHash> scanResults;
+            /* Guarded by discovery->dataMutex. */
+            u32 selfIp = 0;
         public:
             LDUdpSocket(int fd, LANDiscovery *discovery);
             int getFd() override {
@@ -128,6 +130,9 @@ namespace ams::mitm::ldn {
             friend class LanStation;
             // 0: udp 1: tcp 2: client
             os::Mutex pollMutex;
+            // Recursive: updateNodes() runs both with and without it held.
+            // Lock order: pollMutex may be held when taking dataMutex, never the reverse.
+            os::Mutex dataMutex;
             std::unique_ptr<LDUdpSocket> udp;
             std::unique_ptr<LDTcpSocket> tcp;
             std::array<LanStation, StationCountMax> stations;
@@ -162,8 +167,10 @@ namespace ams::mitm::ldn {
             Result scan(NetworkInfo *networkInfo, u16 *count, ScanFilter filter);
             Result setAdvertiseData(const u8 *data, uint16_t size);
             Result createNetwork(const SecurityConfig *securityConfig, const UserConfig *userConfig, const NetworkConfig *networkConfig);
+            Result createNetworkPrivate(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig);
             Result destroyNetwork();
             Result connect(const NetworkInfo *networkInfo, UserConfig *userConfig, u16 localCommunicationVersion);
+            Result connectPrivate(const SecurityParameterData *securityParameter, const UserConfig *userConfig, u16 localCommunicationVersion, const NetworkConfig *networkConfig);
             Result disconnect();
             Result getNetworkInfo(NetworkInfo *pOutNetwork);
             Result getNetworkInfo(NetworkInfo *pOutNetwork, NodeLatestUpdate *pOutUpdates, int bufferCount);
@@ -175,6 +182,7 @@ namespace ams::mitm::ldn {
             LANDiscovery(u16 port = DefaultPort) :
                 disconnect_reason(DisconnectReason::None),
                 pollMutex(false),
+                dataMutex(true),
                 stations({{{1, this}, {2, this}, {3, this}, {4, this}, {5, this}, {6, this}, {7, this}}}),
                 stop(false), initialized(false),
                 networkInfo({}), listenPort(port),
@@ -196,7 +204,8 @@ namespace ams::mitm::ldn {
             };
             int stationCount();
         protected:
-            Result setSocketOpts(int fd);
+            Result createNetworkImpl(const SecurityConfig *securityConfig, const SecurityParameterData *securityParameter, const UserConfig *userConfig, const NetworkConfig *networkConfig);
+            Result setSocketOpts(int fd, bool isTcp);
             Result initTcp(bool listening);
             Result initUdp(bool listening);
             void initNodeStateChange();

@@ -1,10 +1,16 @@
 #include "ldn_icommunication.hpp"
+#include "nifm_manager.hpp"
 #include <arpa/inet.h>
 
 namespace ams::mitm::ldn {
     static_assert(sizeof(NetworkInfo) == 0x480, "sizeof(NetworkInfo) should be 0x480");
     static_assert(sizeof(ConnectNetworkData) == 0x7C, "sizeof(ConnectNetworkData) should be 0x7C");
     static_assert(sizeof(ScanFilter) == 0x60, "sizeof(ScanFilter) should be 0x60");
+    static_assert(sizeof(SecurityParameterData) == 0x20, "sizeof(SecurityParameterData) should be 0x20");
+    static_assert(sizeof(CreateNetworkPrivateConfig) == 0xB8, "sizeof(CreateNetworkPrivateConfig) should be 0xB8");
+    static_assert(offsetof(CreateNetworkPrivateConfig, networkConfig) == 0x98, "CreateNetworkPrivateConfig::networkConfig should be at 0x98");
+    static_assert(sizeof(ConnectPrivateParam) == 0xC0, "sizeof(ConnectPrivateParam) should be 0xC0");
+    static_assert(offsetof(ConnectPrivateParam, networkConfig) == 0xA0, "ConnectPrivateParam::networkConfig should be at 0xA0");
 
     // https://reswitched.github.io/SwIPC/ifaces.html#nn::ldn::detail::IUserLocalCommunicationService
 
@@ -83,6 +89,12 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::GetIpv4Address(sf::Out<u32> address, sf::Out<u32> netmask) {
+        /* Callable before Initialize/after Finalize, when no nifm session is held. */
+        ScopedNifmSession session;
+        if (R_FAILED(session.GetResult())) {
+            return session.GetResult();
+        }
+
         u32 gateway, primary_dns, secondary_dns;
         Result rc = nifmGetCurrentIpConfigInfo(address.GetPointer(), netmask.GetPointer(), &gateway, &primary_dns, &secondary_dns);
 
@@ -176,6 +188,22 @@ namespace ams::mitm::ldn {
         }
     }
 
+    Result ICommunicationService::ScanPrivate(sf::Out<u32> outCount, sf::OutAutoSelectArray<NetworkInfo> buffer, u16 channel, ScanFilter filter) {
+        LogFormat("ICommunicationService::ScanPrivate");
+        return this->Scan(outCount, buffer, channel, filter);
+    }
+
+    Result ICommunicationService::CreateNetworkPrivate(CreateNetworkPrivateConfig data, const sf::InPointerArray<AddressEntry> &entries) {
+        AMS_UNUSED(entries);
+        LogFormat("ICommunicationService::CreateNetworkPrivate");
+        return lanDiscovery.createNetworkPrivate(&data.securityConfig, &data.securityParameter, &data.userConfig, &data.networkConfig);
+    }
+
+    Result ICommunicationService::ConnectPrivate(ConnectPrivateParam param) {
+        LogFormat("ICommunicationService::ConnectPrivate");
+        return lanDiscovery.connectPrivate(&param.securityParameter, &param.userConfig, param.localCommunicationVersion, &param.networkConfig);
+    }
+
     /*nyi*/
     Result ICommunicationService::SetStationAcceptPolicy(u8 policy) {
 		AMS_UNUSED(policy);
@@ -186,11 +214,8 @@ namespace ams::mitm::ldn {
         return 0;
     }
 
-    Result ICommunicationService::ScanPrivate() {
-        return 0;
-    }
-
-    Result ICommunicationService::CreateNetworkPrivate() {
+    Result ICommunicationService::SetProtocol(u32 protocol) {
+        LogFormat("SetProtocol %u", protocol);
         return 0;
     }
 
@@ -203,10 +228,6 @@ namespace ams::mitm::ldn {
     }
 
     Result ICommunicationService::ClearAcceptFilter() {
-        return 0;
-    }
-
-    Result ICommunicationService::ConnectPrivate() {
         return 0;
     }
 }
