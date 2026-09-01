@@ -11,6 +11,12 @@ namespace ams::mitm::ldn {
         public:
             static Result Acquire();
             static void Release();
+            /* Tear the nifm session down and bring it back up without touching
+               the reference count. Needed by the relay reconnect path: a plain
+               reopen only swaps the socket, and because another component also
+               holds a reference, nifmExit() never ran and the stale internet
+               connection request survived. */
+            static Result ForceReinit();
     };
 
     class ScopedNifmSession {

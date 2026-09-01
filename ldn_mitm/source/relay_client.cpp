@@ -88,6 +88,34 @@ namespace ams::mitm::ldn::relay {
         /* Low 16 bits of our virtual address 10.13.x.x; 0 = unassigned. */
         std::atomic<u16> g_client_id{0};
 
+        /* Where the id came from. 0 = assigned before this feature existed,
+           1 = derived from this console's LAN address, 2 = random fallback,
+           3 = rotated away from the derived value to dodge a stale relay
+           session that kept swallowing the echo. */
+        constexpr int IdSourceUnknown  = 0;
+        constexpr int IdSourceHardware = 1;
+        constexpr int IdSourceRandom   = 2;
+        constexpr int IdSourceRotated  = 3;
+        std::atomic_int g_id_source{IdSourceUnknown};
+
+        /* Index of the server the currently open transport is connected to;
+           -1 until a transport opens. Compared against g_selected so the
+           overlay never shows one server's reading under another's name. */
+        std::atomic_int g_active_server{-1};
+
+        /* Defined next to EnsureClientId() below. */
+        bool DeriveIdFromHardware(u16 *out);
+        void RefreshIdSource();
+
+        /* Relay link latency: PING round-trip time in ms. 0 = not measured yet.
+           Only an echo of the ping we are still waiting on updates it. */
+        struct LatencyState {
+            std::atomic<u32> ms{0};
+            std::atomic<int> waiting{0};
+            std::atomic<s64> pending_ms{0};
+        };
+        LatencyState g_latency;
+
         /* Guards relay.cfg I/O and its buffers. */
         constinit os::SdkMutex g_config_mutex;
         constexpr size_t ConfigCap = 4096;
@@ -238,6 +266,11 @@ namespace ams::mitm::ldn::relay {
             }
         }
         LogFormat("relay: loaded %d server(s), selected %d", g_count, g_selected.load());
+
+        /* The id may have been cached in relay.cfg by an earlier boot; work
+           out how it relates to this console's current LAN address so the
+           overlay can report whether the address is stable. */
+        RefreshIdSource();
     }
 
     namespace {
@@ -305,18 +338,78 @@ namespace ams::mitm::ldn::relay {
             fs::CloseFile(f);
         }
 
+        /* Stable hardware-derived id source.
+           The LAN address is a good fingerprint: two consoles can never hold
+           the same one at the same time, and it survives reboots as long as
+           DHCP keeps handing out the same lease. Random is only the last
+           resort, because two consoles drawing from the same 16-bit space
+           collide about once in 60000 pairs -- and a collision shows up as
+           "room is visible but joining fails", which is very hard to debug. */
+        bool DeriveIdFromHardware(u16 *out) {
+            u32 ip = 0;
+            if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
+                return false;
+            }
+            ip = ntohl(ip);
+            if (ip == 0) {
+                return false;
+            }
+            /* Cheap 32 -> 16 fold; good enough to keep distinct LAN
+               addresses distinct after the reserved values are excluded. */
+            u32 h = ip * 2654435761u;
+            h ^= h >> 13;
+            h *= 40503u;
+            u16 id = static_cast<u16>(h ^ (h >> 16));
+            if (BadClientId(id)) {
+                id ^= 0x5A5Au;
+            }
+            if (BadClientId(id)) {
+                return false;
+            }
+            *out = id;
+            return true;
+        }
+
+        /* Classify the id we are currently using. Called on every config load,
+           not only when a fresh id is drawn: a cached id that still matches
+           what this console's LAN address derives is just as stable, and the
+           overlay should say so after every reboot. */
+        void RefreshIdSource() {
+            const u16 id = g_client_id.load();
+            if (id == 0) {
+                g_id_source = IdSourceUnknown;
+                return;
+            }
+            u16 hw = 0;
+            if (!DeriveIdFromHardware(std::addressof(hw))) {
+                /* No usable LAN address: the id must have come from the
+                   random fallback (or predates this feature). */
+                g_id_source = IdSourceRandom;
+                return;
+            }
+            g_id_source = (hw == id) ? IdSourceHardware : IdSourceUnknown;
+        }
+
         u16 EnsureClientId() {
             u16 id = g_client_id.load();
             if (id == 0) {
-                u16 fresh;
-                do {
-                    os::GenerateRandomBytes(std::addressof(fresh), sizeof(fresh));
-                } while (BadClientId(fresh));
+                u16 fresh = 0;
+                bool from_hw = DeriveIdFromHardware(std::addressof(fresh));
+                if (!from_hw) {
+                    do {
+                        os::GenerateRandomBytes(std::addressof(fresh), sizeof(fresh));
+                    } while (BadClientId(fresh));
+                }
                 u16 expected = 0;
                 if (g_client_id.compare_exchange_strong(expected, fresh)) {
                     id = fresh;
+                    /* Persist either way. When the value came from hardware
+                       the write is only a cache, so a read-only SD card still
+                       yields the same address on every boot. */
                     PersistConfig();
-                    LogFormat("relay: assigned virtual address 10.13.%u.%u", (id >> 8) & 0xff, id & 0xff);
+                    RefreshIdSource();
+                    LogFormat("relay: assigned virtual address 10.13.%u.%u (%s)",
+                              (id >> 8) & 0xff, id & 0xff, from_hw ? "hardware" : "random");
                 } else {
                     id = expected;
                 }
@@ -335,7 +428,24 @@ namespace ams::mitm::ldn::relay {
     const char *ServerName(int i) { return (i >= 0 && i < g_count) ? g_servers[i].name : ""; }
 
     int  SelectedServer()     { return g_selected.load(); }
-    void SelectServer(int i)  { if (i >= 0 && i < g_count) { g_selected = i; PersistConfig(); } }
+    void SelectServer(int i)  {
+        if (i < 0 || i >= g_count) {
+            return;
+        }
+        g_selected = i;
+        /* The reading belonged to the previous server. Field logs showed a
+           server that never answered a ping still displaying the previous
+           server's 81ms, which is worse than showing nothing. */
+        g_latency.ms = 0;
+        g_latency.waiting = 0;
+        PersistConfig();
+    }
+
+    /* Which server the open transport is actually talking to. Selecting a
+       different server only rewrites the config; the socket keeps talking to
+       the old host until it is reopened, so this is what the latency reading
+       must be validated against. -1 = no transport open yet. */
+    int  ActiveServer()       { return g_active_server.load(); }
 
     u32  ServerIp() {
         const int i = g_selected.load();
@@ -348,6 +458,18 @@ namespace ams::mitm::ldn::relay {
     u16  ServerPort() {
         const int i = g_selected.load();
         return (i >= 0 && i < g_count) ? g_servers[i].port : 0;
+    }
+
+    int RelayGetIdSource() {
+        return g_id_source.load();
+    }
+
+    u32 RelayGetLocalIp() {
+        u32 ip = 0;
+        if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
+            return 0;
+        }
+        return ntohl(ip);
     }
 
     bool IsSessionPeer(u32 ip) {
@@ -610,6 +732,9 @@ namespace ams::mitm::ldn::relay {
             m_vsrc = vsrc;
             m_rsrc = rsrc;
         }
+        /* Record what we actually connected to, so the latency readout can
+           refuse to show it under a different server's name. */
+        g_active_server = g_selected.load();
         R_SUCCEED();
     }
 
@@ -620,6 +745,7 @@ namespace ams::mitm::ldn::relay {
             fd = m_fd;
             m_fd = -1;
         }
+        g_active_server = -1;
         if (fd >= 0) {
             if (m_have_req) {
                 nifmRequestUnregisterSocketDescriptor(&m_req, fd);
@@ -649,7 +775,8 @@ namespace ams::mitm::ldn::relay {
         m_published = true;
         this->SendKeepalive();
         tcprelay::Start();
-        LogFormat("relay xport: open, vsrc=%08x rsrc=%08x fd=%d", m_vsrc, m_rsrc, m_fd);
+        LogFormat("relay xport: open, %s:%u vsrc=%08x rsrc=%08x fd=%d",
+                  ServerHost(), ServerPort(), m_vsrc, m_rsrc, m_fd);
         R_SUCCEED();
     }
 
@@ -663,12 +790,21 @@ namespace ams::mitm::ldn::relay {
         this->CloseSocket();
     }
 
-    Result RelayTransport::Reopen() {
+        Result RelayTransport::Reopen() {
         if (!m_published) {
             this->CloseSocket();
             return this->Open();
         }
         this->CloseSocket();
+        /* A plain socket swap was not enough. Logs showed the first
+           connection answering no ping at all for 75s while inbound frames
+           kept flowing; only closing the room fixed it, which is the one
+           action that also drops ICommunicationService's nifm reference and
+           therefore really tears the network session down. Do that here. */
+        const Result rr = NifmSessionManager::ForceReinit();
+        if (R_FAILED(rr)) {
+            LogFormat("relay xport: nifm force reinit failed %x", rr);
+        }
         const Result rc = this->OpenSocket();
         if (R_SUCCEEDED(rc)) {
             this->SendKeepalive();
@@ -697,12 +833,66 @@ namespace ams::mitm::ldn::relay {
             return -1;
         }
         ++m_ping_misses;
+        const s64 now_ms = os::ConvertToTimeSpan(os::GetSystemTick()).GetMilliSeconds();
+        /* Arm a fresh measurement when nothing is outstanding, OR when the
+           outstanding one has waited far too long. Without that timeout a
+           single dropped echo -- the server is often still wiring its side up
+           when the first probe goes out -- would leave waiting set forever,
+           and every later ping would only bump the miss counter. The reading
+           then stayed blank until the transport happened to be rebuilt. */
+        const int was_waiting = g_latency.waiting.load();
+        const s64 since = now_ms - g_latency.pending_ms.load();
+        if (was_waiting == 0 || since > PingEchoTimeoutMs) {
+            g_latency.pending_ms = now_ms;
+            g_latency.waiting = 1;
+            if (was_waiting != 0) {
+                LogFormat("relay: ping echo timed out after %lldms, re-arming", since);
+            }
+        }
+        LogFormat("relay: ping tx fd=%d armed=%d waiting=%d since=%lldms misses=%u",
+                  m_fd, was_waiting == 0, g_latency.waiting.load(), since,
+                  m_ping_misses.load());
         const u8 p[4] = { TypePing, 'l', 'd', 'n' };
-        return send(m_fd, p, sizeof(p), 0);
+        const int sent = send(m_fd, p, sizeof(p), 0);
+        if (sent != static_cast<int>(sizeof(p))) {
+            LogFormat("relay: ping send failed rc=%d errno=%d", sent, errno);
+        }
+        return sent;
+    }
+
+    u32 RelayGetLatencyMs() {
+        /* Only trust the reading when the open transport is talking to the
+           server the menu is showing. Selecting a different server rewrites
+           the config immediately but the socket keeps talking to the old host
+           until the worker reopens it, and field screenshots showed one
+           server's latency displayed under every other server's name. */
+        if (g_active_server.load() != g_selected.load()) {
+            return 0;
+        }
+        return g_latency.ms.load();
+    }
+
+    u32 RelayGetVirtualAddress() {
+        const u16 id = g_client_id.load();
+        if (id == 0) {
+            return 0;
+        }
+        return (10u << 24) | (13u << 16) | static_cast<u32>(id);
     }
 
     bool RelayTransport::PathDead() const {
-        return m_fd < 0 || (m_ping_supported.load() && m_ping_misses.load() >= PingMaxMisses);
+        if (m_fd < 0) {
+            return true;
+        }
+        /* Only judge on misses once this server has echoed at least once.
+           Seven of the eight shipped relays now answer no ping at all, and a
+           reconnect did not help -- three different virtual addresses to the
+           same server all stayed silent, while the same address answered
+           instantly on the one server that does echo. Reconnecting on
+           "never answered" would therefore buy nothing and cost a tunnel
+           rebuild on every room, so a non-echoing server is simply left
+           alone and the overlay keeps showing "--". */
+        return m_ping_supported.load() && m_ping_misses.load() >= PingMaxMisses;
     }
 
     int RelayTransport::SendWrapped(u32 src, u32 dst, u16 sport, u16 dport, u16 ip_id, const void *payload, size_t len) {
@@ -924,10 +1114,23 @@ namespace ams::mitm::ldn::relay {
         if (n <= 0) {
             return (n == 0) ? 0 : -1;
         }
-        m_ping_misses = 0;
         const u8 type = buf[0] & 0x7f;
         if (type == TypePing) {
+            /* Only an actual echo clears the miss counter. Clearing it on any
+               inbound frame let relayed Scan broadcasts reset the streak, so
+               the "never answered" detection below rarely tripped. */
             m_ping_supported = true;
+            m_ping_misses = 0;
+            /* The server echoes our PING verbatim: compute the round trip. */
+            const int was_waiting = g_latency.waiting.exchange(0);
+            const s64 rtt = os::ConvertToTimeSpan(os::GetSystemTick()).GetMilliSeconds()
+                            - g_latency.pending_ms.load();
+            if (was_waiting != 0 && rtt >= 0 && rtt < 10000) {
+                g_latency.ms = static_cast<u32>(rtt);
+                LogFormat("relay: ping echo rtt=%lldms -> %ums", rtt, g_latency.ms.load());
+            } else {
+                LogFormat("relay: ping echo dropped (waiting=%d rtt=%lldms)", was_waiting, rtt);
+            }
             return 0;
         }
         if (type == TypeIpv4Frag) {

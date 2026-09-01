@@ -911,6 +911,7 @@ namespace ams::mitm::ldn {
 
     void LANDiscovery::worker() {
         os::Tick last_beacon = os::GetSystemTick();
+        os::Tick last_ping = last_beacon;
         while (!this->stop) {
 
             int rc = loopPoll();
@@ -938,17 +939,6 @@ namespace ams::mitm::ldn {
                     }
 
                     this->sendRelayScope();
-
-                    if (this->relay->pathDead()) {
-                        if (os::ConvertToTimeSpan(now - this->lastRelayReconnect).GetMilliSeconds() >= RelayReconnectMinIntervalMs) {
-                            this->lastRelayReconnect = now;
-                            LogFormat("relay: server path dead, reconnecting transport");
-                            const Result rc = this->relay->reopen();
-                            LogFormat("relay: reconnect %s (%x)", R_SUCCEEDED(rc) ? "ok" : "failed", rc);
-                        }
-                    } else {
-                        this->relay->ping();
-                    }
 
                     if (this->state == CommState::AccessPointCreated) {
                         std::scoped_lock lock(this->dataMutex);
@@ -979,6 +969,36 @@ namespace ams::mitm::ldn {
                             this->onDisconnectFromHost(DisconnectReason::SignalLost);
                         }
                     }
+                } else if (os::ConvertToTimeSpan(now - last_ping).GetMilliSeconds() >= RelayPingIntervalMs) {
+                    /* Probe on its own cadence, outside the beacon gate, so a
+                       fresh server reports latency within about a second
+                       instead of waiting up to a full beacon interval. */
+                    last_ping = now;
+                    this->relay->ping();
+                }
+
+                /* Checked every iteration, not only on beacon ticks: a
+                   connection that never answers a ping is now treated as
+                   suspect after a few probes, and waiting up to a whole beacon
+                   interval on top of that would keep the overlay blank for
+                   seconds longer than necessary. The reconnect itself is
+                   throttled by RelayReconnectMinIntervalMs. */
+                if (this->relay->pathDead()) {
+                    if (os::ConvertToTimeSpan(now - this->lastRelayReconnect).GetMilliSeconds() >= RelayReconnectMinIntervalMs) {
+                        this->lastRelayReconnect = now;
+                        LogFormat("relay: server path dead, reconnecting transport");
+                        const Result rc = this->relay->reopen();
+                        LogFormat("relay: reconnect %s (%x)", R_SUCCEEDED(rc) ? "ok" : "failed", rc);
+                    }
+                } else if (relay::ActiveServer() != relay::SelectedServer()) {
+                    /* The user picked a different server. Selecting only
+                       rewrites the config, so without this the socket would
+                       keep talking to the old host while the menu already
+                       showed the new name -- and its latency with it. */
+                    LogFormat("relay: server selection changed (%d -> %d), reconnecting",
+                              relay::ActiveServer(), relay::SelectedServer());
+                    const Result rc = this->relay->reopen();
+                    LogFormat("relay: switch %s (%x)", R_SUCCEEDED(rc) ? "ok" : "failed", rc);
                 }
             }
             /* Brief unlocked window so IPC threads can grab pollMutex. */

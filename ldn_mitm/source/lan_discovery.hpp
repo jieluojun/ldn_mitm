@@ -157,6 +157,10 @@ namespace ams::mitm::ldn {
             static const int DefaultPort = 11452;
             /* Relay re-announce interval; must stay under the server's 60s idle timeout. */
             static constexpr s64 RelayBeaconIntervalMs = 5000;
+            /* Latency probes run on their own faster cadence. Sharing the
+               beacon interval meant the overlay could sit on "延迟 --" for a
+               full 5s after every server switch before the first echo. */
+            static constexpr s64 RelayPingIntervalMs = 1000;
             static constexpr s64 RelayPeerTimeoutMs = 30000;
             static constexpr s64 RelayAdvertiseMinIntervalMs = 2000;
             static constexpr s64 RelayReconnectMinIntervalMs = 15000;

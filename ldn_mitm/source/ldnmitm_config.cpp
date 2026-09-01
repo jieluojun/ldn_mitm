@@ -66,4 +66,20 @@ namespace ams::mitm::ldn {
         relay::SelectServer(static_cast<int>(index));
         R_SUCCEED();
     }
+    Result LdnConfig::GetRelayLatency(sf::Out<u32> ms) {
+        ms.SetValue(relay::RelayGetLatencyMs());
+        R_SUCCEED();
+    }
+    Result LdnConfig::GetRelayVirtualAddress(sf::Out<u32> addr) {
+        addr.SetValue(relay::RelayGetVirtualAddress());
+        R_SUCCEED();
+    }
+    Result LdnConfig::GetRelayIdSource(sf::Out<u32> source) {
+        source.SetValue(static_cast<u32>(relay::RelayGetIdSource()));
+        R_SUCCEED();
+    }
+    Result LdnConfig::GetRelayLocalIp(sf::Out<u32> addr) {
+        addr.SetValue(relay::RelayGetLocalIp());
+        R_SUCCEED();
+    }
 }

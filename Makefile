@@ -50,11 +50,13 @@ PACK: $(SUBFOLDERS)
 	@ mkdir -p $(NRO_DIR)
 	@ mkdir -p $(TITLE_DIR)/flags
 	@ mkdir -p $(OVERLAY_DIR)
+	@ mkdir -p $(SD_ROOT)/config/ldn_mitm
 	@ cp ldnmitm_config/ldnmitm_config.nro $(NRO_DIR)/ldnmitm_config.nro
 	@ cp ldn_mitm/ldn_mitm.nsp $(TITLE_DIR)/exefs.nsp
-	@ cp overlay/overlay.ovl $(OVERLAY_DIR)/ldnmitm_config.ovl
+	@ cp overlay/overlay.ovl $(OVERLAY_DIR)/ldn_mitm.ovl
 	@ cp ldn_mitm/res/toolbox.json $(TITLE_DIR)/toolbox.json
 	@ touch $(TITLE_DIR)/flags/boot2.flag
+	@ cp config/ldn_mitm/relay.cfg $(SD_ROOT)/config/ldn_mitm/relay.cfg
 #---------------------------------------------------------------------------------
 
 .PHONY: all clean PACK atmosphere-patch $(SUBFOLDERS)

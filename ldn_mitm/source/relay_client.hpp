@@ -37,6 +37,18 @@ namespace ams::mitm::ldn {
         const char *ServerName(int index);
         int  SelectedServer();
         void SelectServer(int index);
+        /* Server the open transport is connected to; -1 when none is open.
+           SelectServer only rewrites the config, so the worker compares the
+           two and reopens when they differ. */
+        int  ActiveServer();
+        /* Last relay PING round-trip time in ms; 0 = not measured yet. */
+        u32  RelayGetLatencyMs();
+        /* Our virtual address (10.13.x.x, host order) or 0 if not assigned yet. */
+        u32  RelayGetVirtualAddress();
+        /* How the id was assigned: 0 unknown, 1 hardware-derived, 2 random. */
+        int  RelayGetIdSource();
+        /* This console's LAN address, host order; 0 if unavailable. */
+        u32  RelayGetLocalIp();
 
         /* ServerIp is 0 when the server is a hostname; resolve ServerHost then. */
         u32 ServerIp();
@@ -71,6 +83,9 @@ namespace ams::mitm::ldn {
 
                 /* Ping misses count only once the server has echoed a ping. */
                 bool PathDead() const;
+
+                /* Last PING round-trip time in ms; 0 = not measured yet. Thread-safe. */
+                u32 PingMs() const { return m_ping_ms.load(); }
 
                 /* Returns a discovery frame's length; game and TCP frames are
                    dispatched internally (returns 0). <0 on error. */
@@ -123,8 +138,14 @@ namespace ams::mitm::ldn {
                 u32 LookupVsrc(u32 real_ip) const;
 
                 static constexpr u32 PingMaxMisses = 4;
+                /* Give up on an unreturned echo after this long so one lost
+                   probe cannot stall the latency readout indefinitely. */
+                static constexpr s64 PingEchoTimeoutMs = 3000;
                 std::atomic<u32> m_ping_misses{0};
                 std::atomic<bool> m_ping_supported{false};
+                /* Last PING round-trip time in ms; 0 = not measured yet.
+                   Only updated by an echo of a ping we are still waiting on. */
+                std::atomic<u32> m_ping_ms{0};
 
                 static constexpr int FragSlots = 4;
                 struct FragSlot {
