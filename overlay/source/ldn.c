@@ -87,6 +87,51 @@ Result ldnMitmGetRelayLocalIp(LdnMitmConfigService *s, u32 *addr) {
     return serviceDispatchOut(&s->s, 65017, *addr);
 }
 
+/* --- runtime server management ----------------------------------------- */
+
+Result ldnMitmGetRelayServerInfo(LdnMitmConfigService *s, u32 index, LdnRelayServerInfo *info) {
+    LdnRelayServerInfo out;
+    Result rc = serviceDispatchInOut(&s->s, 65018, index, out);
+    if (R_SUCCEEDED(rc)) {
+        out.name[sizeof(out.name) - 1] = '\0';
+        out.host[sizeof(out.host) - 1] = '\0';
+        *info = out;
+    }
+    return rc;
+}
+
+Result ldnMitmAddRelayServer(LdnMitmConfigService *s, const LdnRelayServerInfo *info) {
+    /* hipc needs the payload as raw bytes; copying into a local mutable
+       struct also lets us guarantee NUL termination. */
+    LdnRelayServerInfo in = *info;
+    in.name[sizeof(in.name) - 1] = '\0';
+    in.host[sizeof(in.host) - 1] = '\0';
+    return serviceDispatchIn(&s->s, 65019, in);
+}
+
+Result ldnMitmDeleteRelayServer(LdnMitmConfigService *s, u32 index) {
+    return serviceDispatchIn(&s->s, 65020, index);
+}
+
+Result ldnMitmRestoreDefaultRelayServers(LdnMitmConfigService *s) {
+    return serviceDispatch(&s->s, 65021);
+}
+
+Result ldnMitmGetBuiltinRelayServerCount(LdnMitmConfigService *s, u32 *count) {
+    return serviceDispatchOut(&s->s, 65022, *count);
+}
+
+Result ldnMitmGetBuiltinRelayServerInfo(LdnMitmConfigService *s, u32 index, LdnRelayServerInfo *info) {
+    LdnRelayServerInfo out;
+    Result rc = serviceDispatchInOut(&s->s, 65023, index, out);
+    if (R_SUCCEEDED(rc)) {
+        out.name[sizeof(out.name) - 1] = '\0';
+        out.host[sizeof(out.host) - 1] = '\0';
+        *info = out;
+    }
+    return rc;
+}
+
 Result ldnMitmGetVersion(LdnMitmConfigService *s, char *version) {
     char version_s[32];
     Result rc = serviceDispatchOut(&s->s, 65001, version_s);

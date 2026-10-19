@@ -44,6 +44,17 @@ namespace ams::mitm::ldn {
             Result GetRelayIdSource(sf::Out<u32> source);
             /* This console's LAN address, host order; 0 if unavailable. */
             Result GetRelayLocalIp(sf::Out<u32> addr);
+            /* Runtime server management used by the overlay: add a relay,
+               drop one, or restore the factory list. Each mutation rewrites
+               relay.cfg, so the change survives a reboot. */
+            Result GetRelayServerInfo(u32 index, sf::Out<RelayServerInfo> info);
+            Result AddRelayServer(RelayServerInfo info);
+            Result DeleteRelayServer(u32 index);
+            Result RestoreDefaultRelayServers();
+            /* Factory list, so the overlay's add page can list what is not
+               currently configured. */
+            Result GetBuiltinRelayServerCount(sf::Out<u32> count);
+            Result GetBuiltinRelayServerInfo(u32 index, sf::Out<RelayServerInfo> info);
     };
     static_assert(ams::mitm::ldn::IsILdnConfig<LdnConfig>);
 

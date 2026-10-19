@@ -37,6 +37,25 @@ namespace ams::mitm::ldn {
         const char *ServerName(int index);
         int  SelectedServer();
         void SelectServer(int index);
+
+        /* Runtime server management, used by the Tesla overlay so users can
+           add/remove relays without a PC. All of these rewrite relay.cfg on
+           success; the in-memory list is the source of truth until reboot.
+           Ports are host order. */
+        bool AddServer(const char *name, const char *host, u16 port);
+        bool DeleteServer(int index);
+        void RestoreDefaultServers();
+        /* Per-index accessors (ServerHost/ServerPort above follow the current
+           selection). "" / 0 when the index is out of range. */
+        const char *ServerHostAt(int index);
+        u16  ServerPortAt(int index);
+        bool ServerIsBuiltin(int index);
+        /* Factory list (the relays shipped in the archive), exposed so the
+           overlay can offer a deleted one for re-adding. */
+        int  BuiltinServerCount();
+        const char *BuiltinServerName(int index);
+        const char *BuiltinServerHost(int index);
+        u16  BuiltinServerPort(int index);
         /* Server the open transport is connected to; -1 when none is open.
            SelectServer only rewrites the config, so the worker compares the
            two and reopens when they differ. */

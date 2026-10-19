@@ -83,6 +83,51 @@ namespace ams::mitm::ldn::relay {
         struct Server { char name[ServerNameLen]; char host[64]; u32 ip; u16 port; };
         Server g_servers[MaxServers];
         int g_count = 0;
+
+        /* Factory candidate catalog for the overlay's "add server" page.
+           This is intentionally separate from g_defaultServers: restoring
+           defaults must reproduce the shipped 12-entry relay.cfg exactly,
+           while the catalog also offers optional relays. Keep candidate
+           names unique (especially the Dutch entries). */
+        struct BuiltinServer { const char *name; const char *host; u16 port; };
+        constexpr BuiltinServer g_builtin[] = {
+            { "中国·广东",       "gugu.mulaosi.cn",      11451 },  /*   9ms */
+            { "中国·广东(2)",    "ns.mulaosi.cn",        11451 },  /*  15ms; backup */
+            { "中国·江苏",       "wuaiyi.top",           11451 },  /*  30ms */
+            { "中国·上海",       "47.102.121.212",       11451 },  /*  32ms */
+            { "中国·北京",       "olunira.fun",          11451 },  /*  44ms */
+            { "中国·河南(2)",    "122.114.8.38",         11451 },  /*  53ms */
+            { "中国·河南",       "srv.jaxlewis.top",     11451 },  /*  63ms */
+            { "美国",            "tekn0.net",            11451 },  /* 158ms */
+            { "德国·萨克森",     "erdbeerbaerlp.de",     11451 },  /* 193ms */
+            { "丹麦",            "switch.servegame.com", 11451 },  /* 195ms; backup */
+            { "荷兰(3)",         "switch.r3ps4j.nl",     11453 },  /* 205ms; backup */
+            { "荷兰",            "switch.jayseateam.nl", 11451 },  /* 210ms */
+            { "荷兰(2)",         "switch.jayseateam.nl", 11453 },  /* 217ms */
+            { "荷兰(4)",         "switch.r3ps4j.nl",     11451 },  /* 217ms; backup */
+            { "中国·丹麦",       "switch.r3ps4j.nl",     11452 },  /* 233ms */
+            { "美国(2)",         "muitxobem-lanplay.ddns.net", 11451 }, /* 334ms */
+            { "中国·江苏(2)",    "yordon.cn",            11451 },  /* no PING echo */
+        };
+        constexpr int BuiltinCount = static_cast<int>(sizeof(g_builtin) / sizeof(g_builtin[0]));
+
+        /* Exact factory relay.cfg shipped by patch 0009. Keep order, names,
+           and selected=中国·河南 (index zero) stable across "restore". */
+        constexpr BuiltinServer g_defaultServers[] = {
+            { "中国·河南",       "srv.jaxlewis.top",               11451 },
+            { "中国·河南(2)",    "122.114.8.38",                   11451 },
+            { "中国·广东",       "gugu.mulaosi.cn",                11451 },
+            { "中国·江苏",       "wuaiyi.top",                     11451 },
+            { "中国·北京",       "olunira.fun",                    11451 },
+            { "中国·上海",       "47.102.121.212",                 11451 },
+            { "中国·丹麦",       "switch.r3ps4j.nl",               11452 },
+            { "美国",            "tekn0.net",                      11451 },
+            { "美国(2)",         "muitxobem-lanplay.ddns.net",     11451 },
+            { "荷兰",            "switch.jayseateam.nl",           11451 },
+            { "荷兰(2)",         "switch.jayseateam.nl",           11453 },
+            { "德国·萨克森",     "erdbeerbaerlp.de",               11451 },
+        };
+        constexpr int DefaultServerCount = static_cast<int>(sizeof(g_defaultServers) / sizeof(g_defaultServers[0]));
         std::atomic_int  g_selected{0};
         std::atomic_bool g_enabled{false};
         /* Low 16 bits of our virtual address 10.13.x.x; 0 = unassigned. */
@@ -115,6 +160,11 @@ namespace ams::mitm::ldn::relay {
             std::atomic<s64> pending_ms{0};
         };
         LatencyState g_latency;
+
+        /* Preview latency measured while no LDN session is open (no room
+           yet). The overlay shows this instead of "--" until a real relay
+           transport exists. 0 = not measured / unknown. */
+        std::atomic<u32> g_preview_ms{0};
 
         /* Guards relay.cfg I/O and its buffers. */
         constinit os::SdkMutex g_config_mutex;
@@ -313,6 +363,12 @@ namespace ams::mitm::ldn::relay {
                 if (IsDirectiveLine(p)) {
                     continue;
                 }
+                /* Relay entries (name host:port) are regenerated from
+                   g_servers below so add/remove takes effect; comments and
+                   blank lines are copied verbatim. */
+                if (*p != '#' && *p != '\0') {
+                    continue;
+                }
                 const size_t need = std::strlen(line) + 1;
                 if (pos + need >= OutCap) {
                     LogFormat("relay: not persisting settings, rewritten config too large");
@@ -321,6 +377,19 @@ namespace ams::mitm::ldn::relay {
                 std::memcpy(out + pos, line, need - 1);
                 out[pos + need - 1] = '\n';
                 pos += need;
+            }
+
+            /* Regenerate the relay list. */
+            for (int i = 0; i < g_count; i++) {
+                const size_t need = std::strlen(g_servers[i].name) +
+                                    std::strlen(g_servers[i].host) + 24;
+                if (pos + need >= OutCap) {
+                    LogFormat("relay: not persisting settings, server list too large");
+                    return;
+                }
+                pos += static_cast<size_t>(std::snprintf(out + pos, OutCap - pos,
+                    "%s %s:%u\n", g_servers[i].name, g_servers[i].host,
+                    static_cast<unsigned>(g_servers[i].port)));
             }
 
             fs::FileHandle f;
@@ -438,6 +507,7 @@ namespace ams::mitm::ldn::relay {
            server's 81ms, which is worse than showing nothing. */
         g_latency.ms = 0;
         g_latency.waiting = 0;
+        g_preview_ms = 0;
         PersistConfig();
     }
 
@@ -446,6 +516,152 @@ namespace ams::mitm::ldn::relay {
        the old host until it is reopened, so this is what the latency reading
        must be validated against. -1 = no transport open yet. */
     int  ActiveServer()       { return g_active_server.load(); }
+
+    /* --- runtime server management ------------------------------------
+       The Tesla overlay drives these through the config IPC service, so a
+       user can drop a dead relay, free a slot, or add one a friend
+       recommended without pulling the SD card out. Every mutation rewrites
+       relay.cfg, so the change survives a reboot. */
+
+    bool ServerIsBuiltin(int index) {
+        if (index < 0 || index >= g_count) {
+            return false;
+        }
+        for (int i = 0; i < BuiltinCount; i++) {
+            if (std::strcmp(g_servers[index].host, g_builtin[i].host) == 0 &&
+                g_servers[index].port == g_builtin[i].port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const char *ServerHostAt(int index) {
+        return (index >= 0 && index < g_count) ? g_servers[index].host : "";
+    }
+
+    u16 ServerPortAt(int index) {
+        return (index >= 0 && index < g_count) ? static_cast<u16>(g_servers[index].port) : 0;
+    }
+
+    int BuiltinServerCount() {
+        return BuiltinCount;
+    }
+
+    const char *BuiltinServerName(int index) {
+        return (index >= 0 && index < BuiltinCount) ? g_builtin[index].name : "";
+    }
+
+    const char *BuiltinServerHost(int index) {
+        return (index >= 0 && index < BuiltinCount) ? g_builtin[index].host : "";
+    }
+
+    u16 BuiltinServerPort(int index) {
+        return (index >= 0 && index < BuiltinCount) ? static_cast<u16>(g_builtin[index].port) : 0;
+    }
+
+    /* IPv4 literal -> host-order address; 0 means "resolve this hostname". */
+    static u32 ParseIpv4Host(const char *host) {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (std::sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+            return (a << 24) | (b << 16) | (c << 8) | d;
+        }
+        return 0;
+    }
+
+    bool AddServer(const char *name, const char *host, u16 port) {
+        if (name == nullptr || host == nullptr) {
+            return false;
+        }
+        if (host[0] == '\0' || port == 0 || name[0] == '\0') {
+            return false;
+        }
+        {
+            std::scoped_lock lk(g_config_mutex);
+            if (g_count >= MaxServers) {
+                return false;
+            }
+            for (int i = 0; i < g_count; i++) {
+                if (std::strcmp(g_servers[i].host, host) == 0 &&
+                    g_servers[i].port == port) {
+                    return false;
+                }
+            }
+            Server &s = g_servers[g_count];
+            std::strncpy(s.name, name, sizeof(s.name) - 1);
+            s.name[sizeof(s.name) - 1] = '\0';
+            std::strncpy(s.host, host, sizeof(s.host) - 1);
+            s.host[sizeof(s.host) - 1] = '\0';
+            s.port = port;
+            s.ip   = ParseIpv4Host(s.host);
+            g_count++;
+        }
+        PersistConfig();
+        return true;
+    }
+
+    bool DeleteServer(int index) {
+        {
+            std::scoped_lock lk(g_config_mutex);
+            if (index < 0 || index >= g_count) {
+                return false;
+            }
+            for (int i = index; i + 1 < g_count; i++) {
+                g_servers[i] = g_servers[i + 1];
+            }
+            g_count--;
+            /* Keep the same server selected. Removing an entry before it
+               shifts its index down by one; removing the selected entry
+               itself leaves the next server in that slot. Simply clamping
+               to g_count would silently switch the user to another host. */
+            int sel = g_selected.load();
+            if (index < sel) {
+                sel--;
+            } else if (index == sel && sel >= g_count) {
+                sel = (g_count > 0) ? (g_count - 1) : 0;
+            }
+            if (sel < 0) {
+                sel = 0;
+            }
+            g_selected = sel;
+            g_latency.ms = 0;
+            g_latency.waiting = 0;
+            g_preview_ms = 0;
+            /* Removing an entry shifts every index after it. The open
+               transport's index may now point at a different host, and
+               ActiveServer() == SelectedServer() would keep it open, so
+               invalidate it and let the worker reconnect. */
+            g_active_server = -1;
+        }
+        PersistConfig();
+        return true;
+    }
+
+    void RestoreDefaultServers() {
+        {
+            std::scoped_lock lk(g_config_mutex);
+            g_count = 0;
+            for (int i = 0; i < DefaultServerCount && g_count < MaxServers; i++) {
+                Server &s = g_servers[g_count];
+                std::strncpy(s.name, g_defaultServers[i].name, sizeof(s.name) - 1);
+                s.name[sizeof(s.name) - 1] = '\0';
+                std::strncpy(s.host, g_defaultServers[i].host, sizeof(s.host) - 1);
+                s.host[sizeof(s.host) - 1] = '\0';
+                s.port = g_defaultServers[i].port;
+                s.ip   = ParseIpv4Host(s.host);
+                g_count++;
+            }
+            g_selected = 0;
+            g_latency.ms = 0;
+            g_latency.waiting = 0;
+            g_preview_ms = 0;
+            /* Index 0 may now be a different host than the one the open
+               transport is talking to; force a reconnect. */
+            g_active_server = -1;
+        }
+        PersistConfig();
+    }
 
     u32  ServerIp() {
         const int i = g_selected.load();
@@ -464,10 +680,30 @@ namespace ams::mitm::ldn::relay {
         return g_id_source.load();
     }
 
+    namespace {
+        /* nifmGetCurrentIpAddress needs the global nifm session. Outside a
+           relay session nothing held one, so both the "本机 IP" row and the
+           hardware-derived id stayed empty until the user created a room.
+           Acquire it once, lazily, and keep it for the life of the
+           sysmodule (the session manager's refcount stays balanced). */
+        void EnsureNifmSession() {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                const Result rc = NifmSessionManager::Acquire();
+                if (R_FAILED(rc)) {
+                    LogFormat("relay: nifm acquire for ip lookup failed %x", rc);
+                }
+            });
+        }
+    }
+
     u32 RelayGetLocalIp() {
         u32 ip = 0;
         if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
-            return 0;
+            EnsureNifmSession();
+            if (R_FAILED(nifmGetCurrentIpAddress(&ip))) {
+                return 0;
+            }
         }
         return ntohl(ip);
     }
@@ -852,7 +1088,20 @@ namespace ams::mitm::ldn::relay {
         LogFormat("relay: ping tx fd=%d armed=%d waiting=%d since=%lldms misses=%u",
                   m_fd, was_waiting == 0, g_latency.waiting.load(), since,
                   m_ping_misses.load());
-        const u8 p[4] = { TypePing, 'l', 'd', 'n' };
+        /* The ping payload must be EXACTLY 4 bytes, not 3. Server versions
+           disagree on how strict they are:
+             - 1.0.x (switch-lan-play/server, e.g. olunira.fun) just echoes
+               msg.slice(0, 4) and never inspects the length.
+             - 2.0.x/3.0.x (slp-server-rust) parse the frame strictly:
+               Ping::MIN_LENGTH == MAX_LENGTH == 4, and anything else is
+               dropped as NotParseable, so no echo comes back.
+           Four bytes is the only payload that both accept: 1.0 truncates
+           the reply to its first 4 bytes (still type 0x02, which is all we
+           check) and 2.0/3.0 echo all 5 bytes back verbatim. Sending only 3
+           bytes used to work against 1.0 servers and silently failed against
+           every 2.0/3.0 one -- which is why only China-Beijing ever showed a
+           latency reading. */
+        const u8 p[5] = { TypePing, 'l', 'd', 'n', 'p' };
         const int sent = send(m_fd, p, sizeof(p), 0);
         if (sent != static_cast<int>(sizeof(p))) {
             LogFormat("relay: ping send failed rc=%d errno=%d", sent, errno);
@@ -860,20 +1109,221 @@ namespace ams::mitm::ldn::relay {
         return sent;
     }
 
+    namespace {
+        /* --- latency preview (no room yet) ------------------------------
+           Before a game creates/joins a room there is no relay transport, so
+           the overlay used to show "--" until the user opened a room once.
+           Relays answer a bare 5-byte PING from any source (verified
+           2026-10-19 against 1.0 and 2.0/3.0 servers), so a small background
+           thread pings the selected relay every two seconds and the overlay
+           shows that reading until a real transport exists. It never touches
+           the relay connection itself, so it cannot disturb a session. */
+        std::atomic<bool> g_preview_thread_started{false};
+        os::ThreadType g_preview_thread;
+        alignas(os::MemoryPageSize) u8 g_preview_stack[0x4000];
+
+        char g_preview_host[64] = {};
+        u16  g_preview_port = 0;
+        u32  g_preview_ip = 0;
+
+        u32 ResolveHostProbe(const char *host) {
+            /* Same query as RelayTransport::ResolveHostname, minus the nifm
+               socket registration: a one-shot probe does not need it. */
+            if (host == nullptr || host[0] == '\0') {
+                return 0;
+            }
+            u32 a = 0, mask = 0, gw = 0, dns1 = 0, dns2 = 0;
+            nifmGetCurrentIpConfigInfo(&a, &mask, &gw, &dns1, &dns2);
+
+            struct sockaddr_in srv = {};
+            srv.sin_family = AF_INET;
+            srv.sin_port = htons(53);
+            srv.sin_addr.s_addr = (dns1 != 0) ? dns1 : htonl(0x08080808u);
+
+            const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                return 0;
+            }
+            struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            constexpr u8 QueryId0 = 0x13, QueryId1 = 0x37;
+            u8 q[300];
+            size_t p = 0;
+            q[p++] = QueryId0; q[p++] = QueryId1;
+            q[p++] = 0x01; q[p++] = 0x00;
+            q[p++] = 0x00; q[p++] = 0x01;
+            q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0; q[p++] = 0;
+            const char *s = host;
+            while (*s != '\0') {
+                const char *dot = std::strchr(s, '.');
+                const size_t len = dot ? static_cast<size_t>(dot - s) : std::strlen(s);
+                if (len == 0 || len > 63 || p + len + 6 >= sizeof(q)) {
+                    close(fd);
+                    return 0;
+                }
+                q[p++] = static_cast<u8>(len);
+                std::memcpy(q + p, s, len);
+                p += len;
+                s += len;
+                if (*s == '.') { s++; }
+            }
+            q[p++] = 0x00;
+            q[p++] = 0x00; q[p++] = 0x01;
+            q[p++] = 0x00; q[p++] = 0x01;
+
+            if (::sendto(fd, q, p, 0, reinterpret_cast<struct sockaddr *>(&srv), sizeof(srv)) < 0) {
+                close(fd);
+                return 0;
+            }
+            u8 r[512];
+            const ssize_t n = ::recvfrom(fd, r, sizeof(r), 0, nullptr, nullptr);
+            close(fd);
+            if (n < 12) {
+                return 0;
+            }
+            if (r[0] != QueryId0 || r[1] != QueryId1 || (r[2] & 0x80) == 0 || (r[3] & 0x0f) != 0) {
+                return 0;
+            }
+            const int ancount = (r[6] << 8) | r[7];
+            if (ancount < 1) {
+                return 0;
+            }
+            size_t off = 12;
+            while (off < static_cast<size_t>(n) && r[off] != 0) {
+                if ((r[off] & 0xc0) == 0xc0) { off += 1; break; }
+                off += r[off] + 1;
+            }
+            off += 1 + 4;
+            for (int i = 0; i < ancount && off + 12 <= static_cast<size_t>(n); i++) {
+                if ((r[off] & 0xc0) == 0xc0) {
+                    off += 2;
+                } else {
+                    while (off < static_cast<size_t>(n) && r[off] != 0) { off += r[off] + 1; }
+                    off += 1;
+                }
+                if (off + 10 > static_cast<size_t>(n)) {
+                    break;
+                }
+                const int type  = (r[off] << 8) | r[off + 1];
+                const int rdlen = (r[off + 8] << 8) | r[off + 9];
+                off += 10;
+                if (type == 1 && rdlen == 4 && off + 4 <= static_cast<size_t>(n)) {
+                    return Be32(r + off);
+                }
+                off += rdlen;
+            }
+            return 0;
+        }
+
+        u32 ProbeSelectedLatency() {
+            const char *host = ServerHost();
+            const u16 port = ServerPort();
+            if (host[0] == '\0' || port == 0) {
+                return 0;
+            }
+            if (std::strcmp(g_preview_host, host) != 0 || g_preview_port != port) {
+                std::strncpy(g_preview_host, host, sizeof(g_preview_host) - 1);
+                g_preview_host[sizeof(g_preview_host) - 1] = '\0';
+                g_preview_port = port;
+                g_preview_ip = ServerIp();
+                if (g_preview_ip == 0) {
+                    g_preview_ip = ResolveHostProbe(host);
+                }
+            }
+            if (g_preview_ip == 0) {
+                return 0;
+            }
+
+            const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                return 0;
+            }
+            struct sockaddr_in srv = {};
+            srv.sin_family = AF_INET;
+            srv.sin_port = htons(port);
+            srv.sin_addr.s_addr = htonl(g_preview_ip);
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            u32 ms = 0;
+            if (::connect(fd, reinterpret_cast<struct sockaddr *>(&srv), sizeof(srv)) == 0) {
+                static const u8 Ping[5] = { 0x02, 'l', 'd', 'n', 'p' };
+                for (int attempt = 0; attempt < 2 && ms == 0; attempt++) {
+                    struct timeval before = {};
+                    gettimeofday(&before, nullptr);
+                    if (::send(fd, Ping, sizeof(Ping), 0) == static_cast<int>(sizeof(Ping))) {
+                        u8 reply[16];
+                        const ssize_t n = ::recv(fd, reply, sizeof(reply), 0);
+                        if (n >= 4 && reply[0] == 0x02) {
+                            struct timeval after = {};
+                            gettimeofday(&after, nullptr);
+                            const s64 us = (static_cast<s64>(after.tv_sec) - before.tv_sec) * 1000000LL +
+                                           (static_cast<s64>(after.tv_usec) - before.tv_usec);
+                            ms = (us <= 0) ? 1 : static_cast<u32>(us / 1000);
+                        }
+                    }
+                }
+            }
+            close(fd);
+            return ms;
+        }
+
+        void PreviewThread(void *) {
+            while (true) {
+                if (IsEnabled() && ActiveServer() < 0) {
+                    g_preview_ms = ProbeSelectedLatency();
+                } else {
+                    g_preview_ms = 0;
+                }
+                svcSleepThread(2000000000L);
+            }
+        }
+
+        void EnsurePreviewThread() {
+            bool expected = false;
+            if (!g_preview_thread_started.compare_exchange_strong(expected, true)) {
+                return;
+            }
+            const Result rc = os::CreateThread(std::addressof(g_preview_thread), &PreviewThread, nullptr,
+                                               static_cast<void *>(g_preview_stack), sizeof(g_preview_stack), 0x20, 2);
+            if (R_FAILED(rc)) {
+                LogFormat("relay preview: CreateThread failed %x", rc);
+                g_preview_thread_started = false;
+                return;
+            }
+            os::StartThread(std::addressof(g_preview_thread));
+        }
+    }
+
     u32 RelayGetLatencyMs() {
+        /* No transport (no room yet): fall back to the background preview,
+           started on first request. */
+        if (g_active_server.load() != g_selected.load()) {
+            EnsurePreviewThread();
+            return g_preview_ms.load();
+        }
         /* Only trust the reading when the open transport is talking to the
            server the menu is showing. Selecting a different server rewrites
            the config immediately but the socket keeps talking to the old host
            until the worker reopens it, and field screenshots showed one
            server's latency displayed under every other server's name. */
-        if (g_active_server.load() != g_selected.load()) {
-            return 0;
-        }
         return g_latency.ms.load();
     }
 
     u32 RelayGetVirtualAddress() {
-        const u16 id = g_client_id.load();
+        u16 id = g_client_id.load();
+        if (id == 0) {
+            /* Assign the id lazily so the overlay can show the address
+               before a room exists. Only derive it when nifm can tell us the
+               LAN address; otherwise the random fallback would be persisted
+               just because Wi-Fi was not up yet. */
+            EnsureNifmSession();
+            u32 ip = 0;
+            if (R_SUCCEEDED(nifmGetCurrentIpAddress(&ip)) && ip != 0) {
+                id = EnsureClientId();
+            }
+        }
         if (id == 0) {
             return 0;
         }
