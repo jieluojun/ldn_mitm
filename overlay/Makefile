@@ -38,7 +38,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
 # Ignore submodule state for the dirty flag (see ldn_mitm/Makefile).
-TARGET_VERSION := $(shell git describe --tags --always 2>/dev/null || echo unknown)$(shell git diff --quiet --ignore-submodules=all HEAD 2>/dev/null || echo -dirty)
+# 版本串最终会经 IPC 塞进 32 字节的 LdnMitmVersion::raw,这里先截到 31 字符:
+# 浅克隆/CI 里 git describe 会退回 40 位 SHA,加上 -dirty 必然溢出。
+TARGET_VERSION := $(shell (git describe --tags --always 2>/dev/null || echo unknown)$(git diff --quiet --ignore-submodules=all HEAD 2>/dev/null || echo -dirty) | cut -c1-31)
 VERSION_DEFINES	:= -DGITDESCVER="\"${TARGET_VERSION}\""
 
 APP_TITLE	:=	ldn_mitm
@@ -48,7 +50,7 @@ TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
-INCLUDES	:=	include ../libtesla/include
+INCLUDES	:=	source include ../libtesla/include $(PORTLIBS)/include
 
 NO_ICON		:=  1
 
@@ -57,7 +59,8 @@ NO_ICON		:=  1
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
+CFLAGS	:=	-g -Wall -Os -ffunction-sections -fdata-sections \
+			-fno-unwind-tables -fno-asynchronous-unwind-tables \
 			$(ARCH) $(DEFINES) $(VERSION_DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
@@ -65,9 +68,9 @@ CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++20
 
 ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map) -Wl,--gc-sections -Wl,--wrap=framebufferCreate
 
-LIBS	:= -lnx
+LIBS	:=	-lcurl -lz -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

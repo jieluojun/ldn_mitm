@@ -57,6 +57,12 @@ PACK: $(SUBFOLDERS)
 	@ cp ldn_mitm/res/toolbox.json $(TITLE_DIR)/toolbox.json
 	@ touch $(TITLE_DIR)/flags/boot2.flag
 	@ cp config/ldn_mitm/relay.cfg $(SD_ROOT)/config/ldn_mitm/relay.cfg
+	@ mkdir -p $(SD_ROOT)/config/nx-ovlloader
+	@ printf '\000\000\200\000\000\000\000\000' > $(SD_ROOT)/config/nx-ovlloader/heap_size.bin
+	@ echo "预置订阅缓存(chinese_db.json;运行时经 https://v6.gh-proxy.org/ 加速镜像刷新;服务器列表只读 relay.cfg,不预置 servers.json)"
+	@ (curl -fsSL --max-time 60 https://raw.githubusercontent.com/jieluojun/LanPlayMonitor/refs/heads/main/chinese_db.json -o $(SD_ROOT)/config/ldn_mitm/chinese_db.json.tmp && mv $(SD_ROOT)/config/ldn_mitm/chinese_db.json.tmp $(SD_ROOT)/config/ldn_mitm/chinese_db.json) || (rm -f $(SD_ROOT)/config/ldn_mitm/chinese_db.json.tmp; echo "warn: chinese_db.json 预置失败")
+	@ ls -la $(SD_ROOT)/config/ldn_mitm/
+	@ (test -s $(SD_ROOT)/config/ldn_mitm/chinese_db.json) || echo "::warning::chinese_db.json 预置失败——请检查构建日志 curl 输出;即使缺失,在线/房间数字仍可工作(标题将显示标题ID)"
 #---------------------------------------------------------------------------------
 
 .PHONY: all clean PACK atmosphere-patch $(SUBFOLDERS)
