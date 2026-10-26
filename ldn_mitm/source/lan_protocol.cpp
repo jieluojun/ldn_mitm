@@ -1,6 +1,7 @@
 #include "lan_protocol.hpp"
 #include "debug.hpp"
 #include <poll.h>
+#include <cerrno>
 #include <memory>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -21,7 +22,10 @@ int Pollable::Poll(Pollable *fds[], size_t nfds, int timeout) {
     }
     int rc = poll(pfds, nfds, timeout);
     if (rc < 0) {
-        LogFormat("Pollable::Poll failed %d", rc);
+        if (errno == EINTR) {
+            return 0;
+        }
+        LogFormat("Pollable::Poll failed %d errno %d", rc, errno);
         return -1;
     }
     if (rc == 0) {
@@ -34,9 +38,15 @@ int Pollable::Poll(Pollable *fds[], size_t nfds, int timeout) {
             if (pfd.revents & POLL_UNKNOWN) {
                 LogFormat("Poll: %zu(%d) revents=0x%08X", i, pfd.fd, pfd.revents);
             }
-            if (pfd.revents & (POLLERR | POLLHUP)) {
-                LogFormat("Poll: (POLLERR | POLLHUP) %zu(%d) revents=0x%x", i, pfd.fd, pfd.revents);
+            if (pfd.revents & (POLLHUP | POLLNVAL)) {
+                LogFormat("Poll: (POLLHUP/POLLNVAL) %zu(%d) revents=0x%x", i, pfd.fd, pfd.revents);
                 fds[i]->onClose();
+            } else if (pfd.revents & POLLERR) {
+                /* Usually transient (ICMP): clear SO_ERROR and keep the socket. */
+                int soerr = 0;
+                socklen_t optlen = sizeof(soerr);
+                getsockopt(pfd.fd, SOL_SOCKET, SO_ERROR, &soerr, &optlen);
+                LogFormat("Poll: transient POLLERR %zu(%d) so_error=%d, keeping socket", i, pfd.fd, soerr);
             } else if (pfd.revents & (POLLIN | POLLPRI)) {
                 int rc = fds[i]->onRead();
                 if (rc != 0) {
@@ -119,6 +129,7 @@ int LanSocket::recvPacket(MessageCallback callback) {
     }
 
     LANPacketHeader *header = (decltype(header))buffer;
+    this->rxSeq = header->seq;
 
     auto body = buffer + HeaderSize;
     auto bodyLen = len - HeaderSize;
@@ -177,15 +188,18 @@ void LanSocket::prepareHeader(LANPacketHeader &header, LANPacketType type) {
     header.compressed = false;
     header.length = 0;
     header.decompress_length = 0;
-    header._reserved[0] = 0;
-    header._reserved[1] = 0;
+    /* 0 means unstamped; skip it on wrap. */
+    if (++this->txSeq == 0) {
+        ++this->txSeq;
+    }
+    header.seq = this->txSeq;
 }
 
 ssize_t TcpLanSocketBase::recvfrom(void *buf, size_t len, struct sockaddr_in *addr) {
 	AMS_UNUSED(addr);
     auto rc = ::recvfrom(this->fd, buf, len, 0, nullptr, 0);
     if (rc == 0) {
-        return -0xFD23;
+        return LanSocketPeerClosed;
     }
     return rc;
 }
@@ -229,7 +243,7 @@ int LanSocket::compress(const void *input, size_t input_size, uint8_t *output, s
         uint8_t count = 0;
 
         if (c == 0) {
-            while (*in == 0 && in < in_end && count < 0xFF) {
+            while (in < in_end && *in == 0 && count < 0xFF) {
                 count += 1;
                 in++;
             }
